@@ -1,1 +1,16 @@
+# --- Rust/Cargo Build Artifacts ---
 /target
+Cargo.lock
+
+# --- OS & IDE Specifics ---
+.DS_Store
+.vscode/
+.idea/
+*.rs.bk
+
+# --- CRITICAL: Cloud Security & Secrets ---
+# This ensures you NEVER accidentally push your Google Cloud keys to GitHub!
+*.json
+credentials.json
+.env
+.secret*
