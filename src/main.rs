@@ -36,6 +36,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
             //1KB buffer for chunking data.
             let mut buffer = [0; 1024];
 
+            let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("hot_tier.log")
+                    .await
+                    .expect("Failed to open hot_tier.log");
+
             loop
             {
                 //read data from buffer
@@ -52,6 +59,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
                     {
                         //store raw data in data var
                         let data = &buffer[0..bytes_read];
+
+                        if let Err(e) = file.write_all(data).await
+                        {
+                            println!("Failed to write to disk: {}", e);
+                            break;
+                        }
+
+                        if let Err(e) = file.write_all(b"\n").await
+                        {
+                            println!("Failed to write newline: {}", e);
+                            break;
+                        }
+
+                        if let Err(e) = file.sync_all().await
+                        {
+                            println!("Failed to sync to disk: {}", e);
+                            break;
+                        }
 
                         //print out data in terminal
                         if let Ok(text) = std::str::from_utf8(data)
