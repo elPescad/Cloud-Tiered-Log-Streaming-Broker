@@ -7,6 +7,7 @@ use yup_oauth2::{read_service_account_key, ServiceAccountAuthenticator};
 use reqwest::Client;
 use dotenvy::dotenv;
 use std::env;
+use std::fmt::format;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::fs::File;
@@ -39,9 +40,105 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
 
     //bind producer socket to port
     let producer_listener = TcpListener::bind("127.0.0.1:8080").await?;
-    println!("Producer listening on port 127.0.0.1.8080");
+    println!("Producer listening on port 127.0.0.1:8080");
+    
+    let mut disk_rx = tx.subscribe();
+
+    //sole purpose is to write to log file and rotate files once it reaches
+    //transfer phase
+
+    /* ---------------------------------------------------------
+     *                     DISK SEGMENT
+     * ---------------------------------------------------------
+     *  */
+    tokio::spawn(async move {
+        println!("Disk manager task running in background");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("hot_tier.log")
+            .await
+            .expect("Failed to open hot_tier.log");
+
+        //wait for messages
+        loop {
+            match disk_rx.recv().await {
+                Ok(msg) => {
+                    let data = match &msg {
+                        Message::Text(t) =>t.as_bytes(),
+                        Message::Binary(b) => b.as_slice(), 
+                    };
+
+                    //write and sync
+                    if let Err(e) = file.write_all(data).await {
+                        eprintln!("Disk failed to write");
+                        continue;
+                    }
+                    //write data
+                    let _ = file.write_all(b"\n").await;
+                    //drop letover bytes in kernel
+                    let _ = file.sync_all().await;
+
+                    //file rotation
+                    if let Ok(meta) = tokio::fs::metadata("hot_tier.log").await {
+                        //10MB (10KB for now)
+                        if meta.len() >= 10 * 1024 {
+                            println!("Log reached threshold. rotating and uploading...");
+
+                            //get time since Unix epoch to get unique file name for every file
+                            let timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+
+                            //creates new names in order to store unique values in cloud
+                            //name of file to compress
+                            let archive_name = format!("archive_{}.log", timestamp);
+                            //name of file to upload
+                            let cloud_name = format!("segment_{}.log.gz", timestamp);
+
+                            //renames files
+                            if let Err(e) = tokio::fs::rename("hot_tier.log", &archive_name).await {
+                                eprintln!("Failed to rotate log");
+                                continue;
+                            }
+
+                            //Opens new file to write
+                            file = OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open("hot_tier.log")
+                                .await
+                                .expect("Failed to create fresh hot_tier.log");
+
+                            //Gets bucket and key from env file
+                            let bucket = env::var("GCP_BUCKET_NAME").unwrap();
+                            let key = env::var("GCP_KEY_PATH").unwrap();
+
+                            //uploads in the background
+                            tokio::spawn(async move {
+                                match compress_and_upload_log(&archive_name, &bucket, &cloud_name, &key).await {
+                                    Ok(_) => println!("Segment {} securely stored in cloud", cloud_name),
+                                    Err(e) => eprintln!("Upload failed for segment {}: {}", cloud_name, e),
+                                } 
+                            });
+
+                        }
+                    }
+                }
+                Err(_) => {
+                    continue;
+                }
+            }
+        }
+    });
 
     //clone transmiter for producer
+
+    /* ---------------------------------------------------------
+     *                    PRODUCER SEGMENT
+     * ---------------------------------------------------------
+     *  */
     let tx_producer = tx.clone();
 
     tokio::spawn(async move
@@ -69,14 +166,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
                 //1KB buffer for chunking data.
                 let mut buffer = [0; 1024];
 
-                //Allows both reading and writing
-                let mut file = OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("hot_tier.log")
-                        .await
-                        .expect("Failed to open hot_tier.log");
-
                 loop
                 {
                     //read data from buffer
@@ -94,25 +183,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
                             //store raw data in data var
                             let data = &buffer[0..bytes_read];
 
-                            if let Err(e) = file.write_all(data).await
-                            {
-                                println!("Failed to write to disk: {}", e);
-                                break;
-                            }
-
-                            if let Err(e) = file.write_all(b"\n").await
-                            {
-                                println!("Failed to write newline: {}", e);
-                                break;
-                            }
-
-                            //cleans up any extra bytes left in the kernel
-                            if let Err(e) = file.sync_all().await
-                            {
-                                println!("Failed to sync to disk: {}", e);
-                                break;
-                            }
-
                             //print out data in terminal
                             let msg = if let Ok(text) = std::str::from_utf8(data)
                                 {
@@ -128,53 +198,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
                                 };
 
                             let _ = tx_inner.send(msg);
-
-                            //get size in bytes of file
-                            let delay_meta = tokio::fs::metadata("hot_tier.log").await;
-                            if let Ok(meta) = delay_meta {
-                                let threshold = 10 * 1024;
-
-                                if meta.len() >= threshold {
-                                    println!("Log reached threshold. rotating and updating");
-
-                                    //Generate unique timestamp for each file name
-                                    let timestamp = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
-                                        .as_secs();
-
-                                    let archive_name = format!("archive_{}.log", timestamp);
-                                    let cloud_name = format!("segment_{}.gz", timestamp);
-
-                                    //Rename the hot file
-                                    if let Err(e) = tokio::fs::rename("hot_tier.log", &archive_name).await {
-                                        eprintln!("Failed to rotate log: {}", e);
-                                        break;
-                                    }
-                                
-
-                                    //Immedietly point our producer to new hot file
-                                    //Rust autocloses the old file when we reassign mut file
-                                    file = OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open("hot_tier.log")
-                                        .await
-                                        .expect("Failed to create fresh hot_tier.log");
-
-                                    //upload in the background so producer isn't blocked
-                                    let bucket = env::var("GCP_BUCKET_NAME").unwrap();
-                                    let key = env::var("GCP_KEY_PATH").unwrap();
-
-                                    tokio::spawn(async move {
-                                        match compress_and_upload_log(&archive_name, &bucket,&cloud_name, &key).await {
-                                            Ok(_) => println!("Segment {} securely stored in cloud", cloud_name),
-                                            Err(e) => eprintln!("Upload failed for segment {}: {}", cloud_name, e),
-                                        }
-                                    });
-                                }
-                            }
-
                         }
                         Err(e) =>
                         {
@@ -190,8 +213,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
 
     //bind consumer socket to port
     let consumer_listener = TcpListener::bind("127.0.0.1:8081").await?;
-    println!("Consumer listening on port 127.0.0...8081");
+    println!("Consumer listening on port 127.0.0.1:8081");
 
+    /* ---------------------------------------------------------
+     *                     CONSUMER SEGMENT
+     * ---------------------------------------------------------
+     */
     //Consumer Enginer runs on main thread
     loop
     {
