@@ -6,18 +6,24 @@ use tokio::sync::broadcast;
 use yup_oauth2::{read_service_account_key, ServiceAccountAuthenticator};
 use reqwest::Client;
 use dotenvy::dotenv;
+use serde::{Serialize, Deserialize};
 use std::env;
-use std::fmt::format;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::fs::File;
 use std::io::{Read, Write};
 
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BrokerMessage {
+    pub topic: String,
+    pub timestamp: u64,
+    pub payload: String,
+}
 
+#[derive(Clone, Debug)]
 enum Message
 {
-    Text(String),
+    Json(BrokerMessage),
     Binary(Vec<u8>),
 }
 //Box acts essentially as a pointer but without the need to manually dereference
@@ -65,13 +71,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
             match disk_rx.recv().await {
                 Ok(msg) => {
                     let data = match &msg {
-                        Message::Text(t) =>t.as_bytes(),
-                        Message::Binary(b) => b.as_slice(), 
+                        Message::Json(j) => serde_json::to_vec(j).unwrap(),
+                        Message::Binary(b) => b.clone(), 
                     };
 
                     //write and sync
-                    if let Err(e) = file.write_all(data).await {
-                        eprintln!("Disk failed to write");
+                    if let Err(e) = file.write_all(&data).await {
+                        eprintln!("Disk failed to write: {}", e);
                         continue;
                     }
                     //write data
@@ -82,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
                     //file rotation
                     if let Ok(meta) = tokio::fs::metadata("hot_tier.log").await {
                         //10MB (10KB for now)
-                        if meta.len() >= 10 * 1024 {
+                        if meta.len() >= 10 * 1024 * 1024{
                             println!("Log reached threshold. rotating and uploading...");
 
                             //get time since Unix epoch to get unique file name for every file
@@ -99,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
 
                             //renames files
                             if let Err(e) = tokio::fs::rename("hot_tier.log", &archive_name).await {
-                                eprintln!("Failed to rotate log");
+                                eprintln!("Failed to rotate log: {}", e);
                                 continue;
                             }
 
@@ -184,11 +190,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
                             let data = &buffer[0..bytes_read];
 
                             //print out data in terminal
-                            let msg = if let Ok(text) = std::str::from_utf8(data)
+                            let msg = if let Ok(json_data) = serde_json::from_slice::<BrokerMessage>(data)
                                 {
                                     //if data is a text str
-                                    println!("Recieved Transaction log from [{}]: {}", addr, text.trim());
-                                    Message::Text(text.to_string())
+                                    println!("Received JSON on topic '{}' from [{}]: {}", json_data.topic, addr, json_data.payload);
+                                    Message::Json(json_data)
                                 }
                                 else
                                 {
@@ -236,10 +242,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
                     {
                         match msg
                         {    
-                            Message::Text(text) =>
+                            Message::Json(json_data) =>
                             {
-                                println!("Recieved text: {}", text);
-                                let _ = socket.write_all(text.as_bytes()).await;
+                                let output = format!("[TOPIC: {}] {}", json_data.topic, json_data.payload);
+                                println!("Forwarding Json to consumer");
+                                let _ = socket.write_all(output.as_bytes()).await;
                             }
                             Message::Binary(bytes) =>
                             {
