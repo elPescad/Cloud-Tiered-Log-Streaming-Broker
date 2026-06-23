@@ -2,101 +2,299 @@ use tokio::net::TcpListener;
 use tokio::io::AsyncReadExt;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::broadcast;
+use yup_oauth2::{read_service_account_key, ServiceAccountAuthenticator};
+use reqwest::Client;
+use dotenvy::dotenv;
+use std::env;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use std::fs::File;
+use std::io::{Read, Write};
 
-#[tokio::main]
+#[derive(Clone, Debug)]
+
+enum Message
+{
+    Text(String),
+    Binary(Vec<u8>),
+}
 //Box acts essentially as a pointer but without the need to manually dereference
 //here main runs asynchronously and returns type () -> good or it returns
 //a dyanmic error type as a pointer Box
+#[tokio::main]
+
 async fn main() -> Result<(), Box<dyn std::error::Error>>
 {
+    //load .env into file
+    dotenv().ok();
+
     println!("Starting cloud tiered broker...");
     //the '?' lets us error check each statement
 
-    //bind server to local machine on port 8080
-    let listener = TcpListener::bind("127.0.0.1:8080").await?;
-    println!("socket bound to port 127.0.0.1.8080");
+    //creates channel that can hold 100 unread messages in RAM
+    //tx is transmitter
+    //rx is reciever
+    let (tx, _rx) = broadcast::channel::<Message>(100);
 
-    //infinite loop
+    //bind producer socket to port
+    let producer_listener = TcpListener::bind("127.0.0.1:8080").await?;
+    println!("Producer listening on port 127.0.0.1.8080");
+
+    //clone transmiter for producer
+    let tx_producer = tx.clone();
+
+    tokio::spawn(async move
+    {
+        //infinite loop
+        loop
+        {
+            //in rust vars are immutable
+            //you must declare mut if you want to change it.
+
+            //wait for producer application to connect
+            let (mut socket, addr) = producer_listener.accept().await.expect("Failed to accept");
+            println!("New producer connected at {}", addr);
+
+            let tx_inner = tx_producer.clone();
+
+            //tokio::spawn says to run this task in the background
+            //however async move prevents overwriting the data
+            //thus this code block immedietly returns and runs in the
+            //background and allows the line above to run again.
+
+            //producer engine moved entierly to background
+            tokio::spawn(async move
+            {
+                //1KB buffer for chunking data.
+                let mut buffer = [0; 1024];
+
+                //Allows both reading and writing
+                let mut file = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("hot_tier.log")
+                        .await
+                        .expect("Failed to open hot_tier.log");
+
+                loop
+                {
+                    //read data from buffer
+                    match socket.read(&mut buffer).await
+                    {
+                        //producer disconnected
+                        Ok(0) =>
+                        {
+                            println!("Producer {} Disconnected cleanly", addr);
+                            break;
+                        }
+                        //bytes were read. Store them as param
+                        Ok(bytes_read) =>
+                        {
+                            //store raw data in data var
+                            let data = &buffer[0..bytes_read];
+
+                            if let Err(e) = file.write_all(data).await
+                            {
+                                println!("Failed to write to disk: {}", e);
+                                break;
+                            }
+
+                            if let Err(e) = file.write_all(b"\n").await
+                            {
+                                println!("Failed to write newline: {}", e);
+                                break;
+                            }
+
+                            //cleans up any extra bytes left in the kernel
+                            if let Err(e) = file.sync_all().await
+                            {
+                                println!("Failed to sync to disk: {}", e);
+                                break;
+                            }
+
+                            //print out data in terminal
+                            let msg = if let Ok(text) = std::str::from_utf8(data)
+                                {
+                                    //if data is a text str
+                                    println!("Recieved Transaction log from [{}]: {}", addr, text.trim());
+                                    Message::Text(text.to_string())
+                                }
+                                else
+                                {
+                                    //if data is anything else
+                                    println!("Recieved {} raw binary bytes from [{}]", bytes_read, addr);
+                                    Message::Binary(data.to_vec())
+                                };
+
+                            let _ = tx_inner.send(msg);
+
+                            //get size in bytes of file
+                            let delay_meta = tokio::fs::metadata("hot_tier.log").await;
+                            if let Ok(meta) = delay_meta {
+                                let threshold = 10 * 1024;
+
+                                if meta.len() >= threshold {
+                                    println!("Log reached threshold. rotating and updating");
+
+                                    //Generate unique timestamp for each file name
+                                    let timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs();
+
+                                    let archive_name = format!("archive_{}.log", timestamp);
+                                    let cloud_name = format!("segment_{}.gz", timestamp);
+
+                                    //Rename the hot file
+                                    if let Err(e) = tokio::fs::rename("hot_tier.log", &archive_name).await {
+                                        eprintln!("Failed to rotate log: {}", e);
+                                        break;
+                                    }
+                                
+
+                                    //Immedietly point our producer to new hot file
+                                    //Rust autocloses the old file when we reassign mut file
+                                    file = OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open("hot_tier.log")
+                                        .await
+                                        .expect("Failed to create fresh hot_tier.log");
+
+                                    //upload in the background so producer isn't blocked
+                                    let bucket = env::var("GCP_BUCKET_NAME").unwrap();
+                                    let key = env::var("GCP_KEY_PATH").unwrap();
+
+                                    tokio::spawn(async move {
+                                        match compress_and_upload_log(&archive_name, &bucket,&cloud_name, &key).await {
+                                            Ok(_) => println!("Segment {} securely stored in cloud", cloud_name),
+                                            Err(e) => eprintln!("Upload failed for segment {}: {}", cloud_name, e),
+                                        }
+                                    });
+                                }
+                            }
+
+                        }
+                        Err(e) =>
+                        {
+                            println!("Error reading data from socket [{}]: {}", addr, e);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+
+    //bind consumer socket to port
+    let consumer_listener = TcpListener::bind("127.0.0.1:8081").await?;
+    println!("Consumer listening on port 127.0.0...8081");
+
+    //Consumer Enginer runs on main thread
     loop
     {
-        //in rust vars are immutable
-        //you must declare mut if you want to change it.
+        let (mut socket, addr) = consumer_listener.accept().await?;
+        println!("New consumer connected at {}", addr);
 
-        //wait for producer application to connect
-        let (mut socket, addr) = listener.accept().await?;
-        println!("New producer connected at {}", addr);
+        //create a reciever for this consumer
+        let mut my_rx = tx.subscribe();
 
-
-        //tokio::spawn says to run this task in the background
-        //however async move prevents overwriting the data
-        //thus this code block immedietly returns and runs in the
-        //background and allows the line above to run again.
-        tokio::spawn(async move
-        {
-            //1KB buffer for chunking data.
-            let mut buffer = [0; 1024];
-
-            let mut file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("hot_tier.log")
-                    .await
-                    .expect("Failed to open hot_tier.log");
-
-            loop
-            {
-                //read data from buffer
-                match socket.read(&mut buffer).await
+        tokio::spawn(async move {
+            loop {
+                match my_rx.recv().await
                 {
-                    //producer disconnected
-                    Ok(0) =>
+                    Ok(msg) => 
                     {
-                        println!("Producer {} Disconnected cleanly", addr);
-                        break;
+                        match msg
+                        {    
+                            Message::Text(text) =>
+                            {
+                                println!("Recieved text: {}", text);
+                                let _ = socket.write_all(text.as_bytes()).await;
+                            }
+                            Message::Binary(bytes) =>
+                            {
+                                println!("Recieved {} binary bytes", bytes.len());
+                                let _ = socket.write_all(&bytes).await;
+                            }
+                        }
+
+                        let _ = socket.write_all(b"\n").await;
                     }
-                    //bytes were read. Store them as param
-                    Ok(bytes_read) =>
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed_count)) =>
                     {
-                        //store raw data in data var
-                        let data = &buffer[0..bytes_read];
-
-                        if let Err(e) = file.write_all(data).await
-                        {
-                            println!("Failed to write to disk: {}", e);
-                            break;
-                        }
-
-                        if let Err(e) = file.write_all(b"\n").await
-                        {
-                            println!("Failed to write newline: {}", e);
-                            break;
-                        }
-
-                        if let Err(e) = file.sync_all().await
-                        {
-                            println!("Failed to sync to disk: {}", e);
-                            break;
-                        }
-
-                        //print out data in terminal
-                        if let Ok(text) = std::str::from_utf8(data)
-                        {
-                            //if data is a text str
-                            println!("Recieved Transaction log from [{}]: {}", addr, text.trim());
-                        }
-                        else
-                        {
-                            //if data is anything else
-                            println!("Recieved {} raw binary bytes from [{}]", bytes_read, addr);
-                        }
+                        eprintln!("Warning: Reciever lagged behind. Missed {} messages", missed_count);
                     }
-                    Err(e) =>
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) =>
                     {
-                        println!("Error reading data from socket [{}]: {}", addr, e);
+                        eprintln!("Channel closed. the sender was dropped.");
                         break;
                     }
                 }
             }
         });
+    }
+}
+
+//compresses file and uploads
+async fn compress_and_upload_log(local_filename: &str, bucket_name: &str, object_name: &str, key_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Compressing {}...", local_filename);
+
+    //creates new .gz file
+    let compressed_filename = format!("{}.gz", local_filename);
+    //anon block. Acts as sandbox to ensure coder finishes and closes file cleanly
+    {
+        let mut input_file = File::open(local_filename)?;
+        //create new file to store compressed data whose path is the new .gz file name we created
+        let compressed_file = File::create(&compressed_filename)?;
+        let mut encoder = GzEncoder::new(compressed_file, Compression::default());
+
+        //create storage for bytes
+        let mut buffer = Vec::new();
+        input_file.read_to_end(&mut buffer)?;
+        //write stored bytes into new compression file
+        encoder.write_all(&buffer)?;
+        encoder.finish()?;
+    }
+
+    //Authenticate with Google Cloud using JSON key
+    println!("Authenticating with GCP...");
+    let secret = read_service_account_key(key_path).await?;
+    let auth = ServiceAccountAuthenticator::builder(secret).build().await?;
+    let scopes = &["https://www.googleapis.com/auth/devstorage.read_write"];
+    let token = auth.token(scopes).await?;
+
+    //Upload compressed file to google cloud bucket
+    println!("Uploading {} to Google Cloud...", compressed_filename);
+    let file_bytes = tokio::fs::read(&compressed_filename).await?;
+    let client = Client::new();
+
+    let url = format!(
+        "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&name={}",
+        bucket_name, object_name
+    );
+
+    let response = client
+        .post(&url)
+        .bearer_auth(token.token().unwrap())
+        .header("Content-Type", "application/gzip")
+        .body(file_bytes)
+        .send()
+        .await?;
+
+    //Verify Delivery and Cleanup local drive
+    if response.status().is_success() {
+        println!("Success. File {} safely stored in bucket.", object_name);
+
+        //safely wipe local data because google confirmed reciept
+        tokio::fs::remove_file(local_filename).await?;
+        tokio::fs::remove_file(&compressed_filename).await?;
+        println!("Local files wiped cleanly");
+        Ok(())
+    } else {
+        let error_msg = response.text().await?;
+        Err(format!("GCP rejected the upload: {}", error_msg).into())
     }
 }
