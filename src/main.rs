@@ -23,7 +23,6 @@ use axum::{
     extract::State,
     http::StatusCode,
 };
-use std::net::SocketAddr;
 use std::io::{Read, Write};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -49,7 +48,6 @@ pub struct IngestPayload {
 enum Message
 {
     Json(BrokerMessage),
-    Binary(Vec<u8>),
 }
 //Box acts essentially as a pointer but without the need to manually dereference
 //here main runs asynchronously and returns type () -> good or it returns
@@ -93,7 +91,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
                 Ok(msg) => {
                     let data = match &msg {
                         Message::Json(j) => serde_json::to_vec(j).unwrap(),
-                        Message::Binary(b) => b.clone(), 
                     };
 
                     //write and sync
@@ -176,9 +173,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>
     let http_listener = TcpListener::bind("0.0.0.0:8080").await?;
 
     //Spawn the http server in the background
-    tokio::spawn(async move {
-        axum::serve(http_listener, app).await.expect("Axum server crashed");
-    });
+    println!("Axum HTTP server actively listening on 0.0.0.0:8080...");
+    axum::serve(http_listener, app).await.expect("Axum server crashed");
 
     Ok(())
 }
@@ -285,9 +281,6 @@ async fn consumer_handler(State(tx): State<broadcast::Sender<Message>> ) -> Sse<
                     //Convert the string to struct and push it to HTTP client
                     let data_str = serde_json::to_string(&json_data).unwrap_or_default();
                     yield Ok(Event::default().data(data_str));
-                }
-                Ok(Message::Binary(_)) => {
-                    //Ignore binary data for stream
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
                     eprintln!("Consume lagged, missed {} message", missed);
